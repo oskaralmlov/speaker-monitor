@@ -1,0 +1,16 @@
+[Unit]
+Description=Speaker Monitor Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=True
+ExecStart=/usr/local/bin/speaker-monitor \
+    --quiet \
+    --leader-ip <LEADER IP> \
+    --member <MEMBER_NAME>:<MEMBER_IP>
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
