@@ -1,0 +1,179 @@
+#!/usr/bin/env -S python3 -u
+
+import sys
+import time
+import enum
+import requests
+import argparse
+
+SPEAKER_MODES = {
+    '0': "NONE",
+    '1': "AIRPLAY",
+    '2': "DLNA",
+    '10': "WIIMU",
+    '11': "WIIMU_LOCAL",
+    '12': "WIIMU_STATION",
+    '13': "WIIMU_RADIO",
+    '14': "WIIMU_SONGLIST",
+    '19': "WIIMU_MAX",
+    '20': "HTTP",
+    '21': "HTTP_LOCAL",
+    '29': "HTTP_MAX",
+    '30': "ALARM",
+    '31': "JOINED", # Unclear
+    '40': "LINEIN",
+    '41': "BT",
+    '42': "EXT_LOCAL",
+    '43': "OPTICAL",
+    '49': "LINEIN_MAX",
+    '50': "MIRROR",
+    '60': "TALK",
+    '99': "SLAVE",
+}
+
+
+def parse_args():
+    """
+    Parse command-line arguments for configuration.
+    """
+    parser = argparse.ArgumentParser(
+        description="Monitor and auto-recover Sonos-like multi-room speaker group."
+    )
+    parser.add_argument(
+        '--leader-ip', '-l',
+        required=True,
+        help='IP address of the leader speaker'
+    )
+    parser.add_argument(
+        '--member', '-m',
+        action='append',
+        default=[],
+        metavar='NAME=IP',
+        required=True,
+        help=('Member speaker entry in NAME=IP format; can be specified multiple times')
+    )
+    parser.add_argument(
+        '--interval', '-i',
+        type=int,
+        default=5,
+        help='How often the script should poll for status updates'
+    )
+    parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Hide informational output'
+    )
+    return parser.parse_args()
+
+
+def send_command(ip, command, timeout=10):
+    '''Send an HTTPAPI command; return JSON/text or None.'''
+    url = f'http://{ip}:80/httpapi.asp?command={command}'
+    try:
+        r = requests.get(url, timeout=timeout)
+    except requests.RequestException:
+        return None
+    if r.status_code != 200:
+        return None
+    try:
+        return r.json()
+    except ValueError:
+        return r.text.strip()
+
+
+def get_player_status(ip):
+    return send_command(ip, 'getPlayerStatus')
+
+
+def get_speaker_mode(ip):
+    player_status = get_player_status(ip)
+    return SPEAKER_MODES.get(str(player_status.get('mode')), 'UNKNOWN')
+
+
+def get_member_list(leader_ip):
+    data = send_command(leader_ip, 'multiroom:getSlaveList')
+    if not data or 'slave_list' not in data:
+        return None
+    return {entry.get('name') for entry in data['slave_list']}
+
+
+def set_volume(ip, volume):
+    send_command(ip, f'setPlayerCmd:vol:{volume}')
+
+
+def add_member(leader_ip, member_ip):
+    '''
+    Tell the member to join the leader.
+    Returns True if the member accepted the command.
+    '''
+    cmd = f'ConnectMasterAp:JoinGroupMaster:eth{leader_ip}:wifi0.0.0.0'
+    return send_command(member_ip, cmd) is not None
+
+
+def monitor_and_recover(interval, leader_ip, member_speakers, quiet):
+    while True:
+        current_members = get_member_list(leader_ip)
+        if current_members is None:
+            print('⚠️  Couldn’t fetch leader member list; retrying…', file=sys.stderr)
+            time.sleep(interval)
+            continue
+
+        for speaker_name, speaker_ip in member_speakers.items():
+            if speaker_name in current_members:
+                if not quiet:
+                    print(f'ℹ️  {speaker_name} is already a member.')
+                continue
+
+            player_status = get_player_status(speaker_ip)
+            if player_status is None:
+                if not quiet:
+                    print(f'ℹ️  {speaker_name} not reachable; skipping…')
+                continue
+
+            speaker_mode = get_speaker_mode(speaker_ip)
+            if speaker_mode not in ('NONE', 'SLAVE'):
+                if not quiet:
+                    print(f'ℹ️  {speaker_name} in {speaker_mode} mode; skipping…')
+                continue
+
+            leader_player = get_player_status(leader_ip)
+            if not leader_player:
+                print('⚠️  Couldn’t fetch leader player; retrying…', file=sys.stderr)
+                time.sleep(interval)
+                continue
+
+            speaker_volume = leader_player.get('vol', 10)
+            print(f'🔈 Setting {speaker_name} volume to {speaker_volume}…')
+            set_volume(speaker_ip, speaker_volume)
+
+            print(f'➕ Sending join command to {speaker_name}…')
+            if add_member(leader_ip, speaker_ip):
+                print(f'✅ {speaker_name} join command accepted.')
+                time.sleep(10)
+            else:
+                print(f'❌ {speaker_name} join command failed.', file=sys.stderr)
+
+        time.sleep(interval)
+
+
+if __name__ == '__main__':
+    args = parse_args()
+
+    # Build member speakers dict from NAME=IP entries
+    member_speakers = {}
+    for entry in args.member:
+        if '=' not in entry:
+            print(f'⚠️  Ignoring invalid member entry: {entry}', file=sys.stderr)
+            continue
+        name, ip = entry.split('=', 1)
+        member_speakers[name] = ip
+
+    try:
+        monitor_and_recover(
+            interval=args.interval,
+            leader_ip=args.leader_ip,
+            member_speakers=member_speakers,
+            quiet=args.quiet
+        )
+    except KeyboardInterrupt:
+        print('\n🛑 Interrupted by user.')
